@@ -1,6 +1,6 @@
 #include <stdio.h>
 
-int main() {
+int main(void) {
     /* 我的第一个 C 程序 */
     printf("Hello, World! \n");
 

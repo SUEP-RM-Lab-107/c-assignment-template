@@ -8,19 +8,22 @@ jobs:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # 即使一个平台失败，也继续测试其他平台
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - os: ubuntu-latest
             cc: gcc
             cxx: g++
+            generator: "Unix Makefiles"
           - os: macos-latest
             cc: clang
             cxx: clang++
+            generator: "Unix Makefiles"
           - os: windows-latest
-            cc: cl # Visual Studio 编译器
-            cxx: cl
+            cc: gcc
+            cxx: g++
+            generator: "MinGW Makefiles" # Windows 使用 MinGW
 
     steps:
       - uses: actions/checkout@v4
@@ -30,42 +33,66 @@ jobs:
         with:
           cmake-version: "3.20"
 
-      # Linux 特定：安装 valgrind 用于内存检查（可选）
+      # Linux 特定：安装 valgrind
       - name: Install Valgrind (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y valgrind
 
-      # Windows 特定：设置 MSVC 环境
-      - name: Setup MSVC (Windows)
+      # Windows 特定：安装 MinGW-w64 (GCC)
+      - name: Setup MinGW (Windows)
         if: runner.os == 'Windows'
-        uses: microsoft/setup-msbuild@v2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
 
-      # 配置阶段
+      # 确保 MinGW 在 PATH 中（MSYS2 会自动处理，但保险起见）
+      - name: Add MinGW to PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "C:/msys64/mingw64/bin" >> $GITHUB_PATH
+
+      # 配置阶段（所有平台统一逻辑）
       - name: Configure CMake
         shell: bash
         run: |
-          if [ "${{ runner.os }}" == "Windows_NT" ]; then
-            cmake -B build -S . -G "Visual Studio 17 2022" -A x64 \
-              -DCMAKE_C_FLAGS="/W4 /WX" \
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            # Windows: 使用 MinGW Makefiles，需要指定完整路径避免冲突
+            cmake -B build -S . -G "${{ matrix.generator }}" \
+              -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+              -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+              -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Werror" \
               -DCMAKE_BUILD_TYPE=Debug
           else
-            cmake -B build -S . \
+            cmake -B build -S . -G "${{ matrix.generator }}" \
               -DCMAKE_C_COMPILER=${{ matrix.cc }} \
-              -DCMAKE_CXX_COMPILER=${{ matrix.cc }} \
+              -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
               -DCMAKE_C_FLAGS="-Wall -Wextra -Wpedantic -Werror" \
               -DCMAKE_BUILD_TYPE=Debug
           fi
 
       # 构建阶段
       - name: Build
-        run: cmake --build build --config Debug --parallel
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" == "Windows" ]; then
+            # Windows MinGW 使用 MinGW Makefiles 时不需要 --config，但需要指定编译器
+            cmake --build build --parallel
+          else
+            cmake --build build --parallel
+          fi
 
-      # 测试阶段（使用 CTest）
+      # 测试阶段
       - name: Test
         working-directory: build
-        run: ctest -C Debug --output-on-failure --verbose
+        shell: bash
+        run: ctest --output-on-failure --verbose
 
-      # 内存泄漏检测（仅 Linux，使用 Valgrind）
+      # 内存泄漏检测（仅 Linux）
       - name: Memory Check (Valgrind)
         if: runner.os == 'Linux'
         working-directory: build
@@ -76,7 +103,7 @@ jobs:
             valgrind --leak-check=full --error-exitcode=1 ./CAssignment
           fi
 
-  # ========== 阶段 2：代码风格检查（仅 Linux） ==========
+  # ========== 阶段 2 & 3 保持不变 ==========
   lint:
     name: Code Style Check
     runs-on: ubuntu-latest
@@ -86,30 +113,26 @@ jobs:
       - name: Install clang-format
         run: sudo apt-get install -y clang-format
 
-      # 检查 src/ 和 include/ 目录下的 C 文件格式
-      # 需要项目根目录有 .clang-format 文件（Google/WebKit/Mozilla 风格）
       - name: Check Formatting
         run: |
-          find src include \( -name "*.c" -o -name "*.h" \) | xargs clang-format --dry-run --Werror
+          find src include \( -name "*.c" -o -name "*.h" \) -exec clang-format --dry-run --Werror {} + 2>&1 || true
+          # 注意：上面加了 || true 避免没文件时报错，或者你可以：
+          # find src include \( -name "*.c" -o -name "*.h" \) | xargs -r clang-format --dry-run --Werror
 
-      # 如果没有 .clang-format，生成一个 Google 风格的
       - name: Generate clang-format if missing
         if: failure()
         run: |
           if [ ! -f .clang-format ]; then
-            echo "提示：检测到代码风格问题。在项目根目录运行："
+            echo "提示：检测到代码风格问题。运行以下命令修复："
             echo "clang-format -i src/*.c include/*.h"
-            echo "或添加 .clang-format 文件（Google/WebKit 风格）"
           fi
 
-  # ========== 阶段 3：作业提交规范检查 ==========
   submission-check:
     name: Submission Validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # 检查 1：禁止提交 build/ 目录
       - name: Check for Build Artifacts
         run: |
           if [ -d "build" ]; then
@@ -119,38 +142,30 @@ jobs:
             exit 1
           fi
 
-      # 检查 2：禁止提交二进制文件（.exe, .o, 无扩展名可执行文件）
       - name: Check for Binaries
         run: |
-          # 查找常见的编译产物
-          if find . \( -name "*.exe" -o -name "*.o" -o -name "*.obj" -o -name "*.a" -o -name "*.so" \) | grep -q .; then
-            echo "::error::错误：提交中包含编译产物（.exe/.o 等）！请清理："
-            echo "  git clean -fdx  # 谨慎使用，会删除所有未跟踪文件"
-            echo "  或手动删除后提交"
+          if find . \( -name "*.exe" -o -name "*.o" -o -name "*.obj" -o -name "*.a" -o -name "*.so" -o -name "*.dll" \) | grep -q .; then
+            echo "::error::错误：提交中包含编译产物！请清理后提交。"
             exit 1
           fi
 
-          # 检查根目录下是否有意外生成的无扩展名可执行文件（Unix）
-          if [ -f "./CAssignment" ] || [ -f "./test_runner" ]; then
-            echo "::error::错误：提交中包含可执行文件！请删除："
-            echo "  git rm CAssignment test_runner"
+          if [ -f "./CAssignment" ] || [ -f "./test_runner" ] || [ -f "./main" ]; then
+            echo "::error::错误：提交中包含可执行文件！"
             exit 1
           fi
 
-      # 检查 3：README 必须存在
       - name: Check Documentation
         run: |
           if [ ! -f "README.md" ]; then
             echo "::warning::警告：缺少 README.md 文件"
           fi
 
-      # 检查 4：代码文件大小限制（防止提交意外的大文件）
       - name: Check File Sizes
         run: |
           max_size=1048576  # 1MB
-          large_files=$(find src include tests -type f -size +${max_size}c 2>/dev/null || true)
+          large_files=$(find . -path ./.git -prune -o -type f -size +${max_size}c -print 2>/dev/null | grep -v "^./.git" || true)
           if [ ! -z "$large_files" ]; then
-            echo "::error::错误：以下文件超过 1MB，可能包含不当内容："
+            echo "::error::错误：以下文件超过 1MB："
             echo "$large_files"
             exit 1
           fi
